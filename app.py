@@ -17,6 +17,7 @@ from sklearn.ensemble import IsolationForest
 import joblib
 import plotly.express as px
 import plotly.graph_objects as go
+import time
 
 # ---------- Helper Functions ----------
 def hash_password(password):
@@ -30,7 +31,6 @@ def validate_pan(pan):
     return bool(re.match(pattern, pan))
 
 def validate_name(name):
-    """Allow only alphabets and spaces"""
     return bool(re.match(r'^[A-Za-z\s]+$', name))
 
 def generate_account_number():
@@ -71,17 +71,19 @@ def calculate_sip_future(sip_amount, months, expected_return=12):
     future_value = sip_amount * (((1 + monthly_rate) ** months - 1) / monthly_rate) * (1 + monthly_rate)
     return round(future_value, 2)
 
-# ---------- Database Manager ----------
+# ---------- Database Manager with timeout ----------
 class DatabaseManager:
     def __init__(self, db_path="banking.db"):
         self.db_path = db_path
     
     def get_connection(self):
-        return sqlite3.connect(self.db_path)
+        # Wait up to 10 seconds if database is locked
+        return sqlite3.connect(self.db_path, timeout=10)
     
     def initialize_database(self):
         conn = self.get_connection()
         cursor = conn.cursor()
+        cursor.execute("PRAGMA journal_mode=WAL")  # Write-Ahead Logging for better concurrency
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS users (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -116,6 +118,7 @@ class DatabaseManager:
                 type TEXT NOT NULL,
                 status TEXT NOT NULL,
                 fraud_score REAL DEFAULT 0.0,
+                source TEXT DEFAULT 'online',
                 FOREIGN KEY (from_account_id) REFERENCES accounts(id),
                 FOREIGN KEY (to_account_id) REFERENCES accounts(id)
             )
@@ -229,7 +232,7 @@ class FraudDetector:
         prediction = self.model.predict(current_features)[0]
         fraud_score = self.model.score_samples(current_features)[0]
         fraud_prob = 1 / (1 + np.exp(-fraud_score))
-        is_fraud = (prediction == -1) or (fraud_prob > 0.7)
+        is_fraud = fraud_prob > 0.7
         return is_fraud, float(fraud_prob)
     
     def train_or_load_model(self):
@@ -291,7 +294,6 @@ if st.session_state.logged_in:
         st.markdown(f"## Welcome, {st.session_state.user_email.split('@')[0]}")
         st.markdown("---")
         
-        # Regular user menu
         if not st.session_state.is_admin:
             selected = option_menu(
                 menu_title="Navigation",
@@ -300,7 +302,6 @@ if st.session_state.logged_in:
                 menu_icon="cast", default_index=0, orientation="vertical",
             )
         else:
-            # Admin menu with submenu handling
             admin_main = option_menu(
                 menu_title="Admin Navigation",
                 options=["Dashboard", "Accounts", "Money Transfer", "Transaction History", "Account Statements", "Profile", "Admin Panel"],
@@ -472,28 +473,35 @@ if st.session_state.logged_in:
             if st.button("Open Account"):
                 conn = db.get_connection()
                 cursor = conn.cursor()
-                if acc_type in ['Savings','Current']:
-                    cursor.execute("SELECT id FROM accounts WHERE user_id=? AND account_type=?", (st.session_state.user_id, acc_type))
-                    if cursor.fetchone():
-                        st.error(f"You already have a {acc_type} account")
+                try:
+                    if acc_type in ['Savings','Current']:
+                        cursor.execute("SELECT id FROM accounts WHERE user_id=? AND account_type=?", (st.session_state.user_id, acc_type))
+                        if cursor.fetchone():
+                            st.error(f"You already have a {acc_type} account")
+                        else:
+                            acc_num = generate_account_number()
+                            cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance) VALUES (?,?,?,?)",
+                                           (st.session_state.user_id, acc_type, acc_num, init_deposit))
+                            conn.commit()
+                            st.success(f"{acc_type} account opened! Number: {acc_num}")
                     else:
                         acc_num = generate_account_number()
-                        cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance) VALUES (?,?,?,?)",
-                                       (st.session_state.user_id, acc_type, acc_num, init_deposit))
+                        metadata = {}
+                        if acc_type == "Fixed Deposit (FD)":
+                            metadata = {"tenure_months": fd_tenure, "interest_rate": fd_rate, "maturity_date": (datetime.now() + timedelta(days=fd_tenure*30)).strftime("%Y-%m-%d")}
+                        elif acc_type == "Systematic Investment Plan (SIP)":
+                            metadata = {"sip_amount": sip_monthly, "months": sip_months, "next_due": datetime.now().strftime("%Y-%m-%d")}
+                        cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance, metadata) VALUES (?,?,?,?,?)",
+                                       (st.session_state.user_id, acc_type, acc_num, init_deposit, str(metadata)))
                         conn.commit()
-                        st.success(f"{acc_type} account opened! Number: {acc_num}")
-                else:
-                    acc_num = generate_account_number()
-                    metadata = {}
-                    if acc_type == "Fixed Deposit (FD)":
-                        metadata = {"tenure_months": fd_tenure, "interest_rate": fd_rate, "maturity_date": (datetime.now() + timedelta(days=fd_tenure*30)).strftime("%Y-%m-%d")}
-                    elif acc_type == "Systematic Investment Plan (SIP)":
-                        metadata = {"sip_amount": sip_monthly, "months": sip_months, "next_due": datetime.now().strftime("%Y-%m-%d")}
-                    cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance, metadata) VALUES (?,?,?,?,?)",
-                                   (st.session_state.user_id, acc_type, acc_num, init_deposit, str(metadata)))
-                    conn.commit()
-                    st.success(f"{acc_type} opened! Account number: {acc_num}")
-                conn.close()
+                        st.success(f"{acc_type} opened! Account number: {acc_num}")
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e):
+                        st.error("Database is busy, please try again in a moment.")
+                    else:
+                        st.error(f"Error: {e}")
+                finally:
+                    conn.close()
                 st.rerun()
         
         st.subheader("📋 Your Accounts")
@@ -520,14 +528,16 @@ if st.session_state.logged_in:
                 if st.button("🗑️ Delete", key=f"del_acc_{acc['id']}"):
                     conn = db.get_connection()
                     cursor = conn.cursor()
-                    if acc['balance'] > 0:
-                        st.error("Cannot delete account with positive balance. Please withdraw all funds first.")
-                    else:
-                        cursor.execute("DELETE FROM accounts WHERE id = ? AND user_id = ?", (acc['id'], st.session_state.user_id))
-                        conn.commit()
-                        st.success(f"Account {acc['account_number']} deleted.")
-                        st.rerun()
-                    conn.close()
+                    try:
+                        if acc['balance'] > 0:
+                            st.error("Cannot delete account with positive balance. Please withdraw all funds first.")
+                        else:
+                            cursor.execute("DELETE FROM accounts WHERE id = ? AND user_id = ?", (acc['id'], st.session_state.user_id))
+                            conn.commit()
+                            st.success(f"Account {acc['account_number']} deleted.")
+                            st.rerun()
+                    finally:
+                        conn.close()
                 st.markdown("---")
     
     # ---------- MONEY TRANSFER ----------
@@ -555,54 +565,97 @@ if st.session_state.logged_in:
             
             amount = st.number_input("Amount (₹)", min_value=1.0, max_value=src_balance, step=100.0)
             
-            st.markdown("### Scan Recipient QR Code")
-            scan_method = st.radio("Choose method", ["Upload QR Image", "Use Camera (Live)"])
+            st.markdown("### Find Recipient")
+            recipient_method = st.radio("Find by:", ["Account Number", "Email ID", "Scan QR Code"])
             recipient_acc = None
+            recipient_email = None
             
-            if scan_method == "Upload QR Image":
-                qr_file = st.file_uploader("Upload QR Code", type=['png','jpg','jpeg'])
-                if qr_file:
-                    decoded = decode_qr_code(qr_file)
-                    if decoded:
-                        st.success(f"Decoded: {decoded}")
-                        conn = db.get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT id FROM accounts WHERE account_number = ?", (decoded,))
-                        acc_data = cursor.fetchone()
-                        conn.close()
-                        if acc_data and acc_data[0] != src_id:
-                            recipient_acc = acc_data[0]
-                            st.success("Recipient account found!")
-                        else:
-                            st.error("Invalid QR code (self or not found)")
-            else:
-                camera_photo = st.camera_input("Take a photo of the QR code")
-                if camera_photo:
-                    decoded = decode_qr_code(camera_photo)
-                    if decoded:
-                        st.success(f"Decoded: {decoded}")
-                        conn = db.get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("SELECT id FROM accounts WHERE account_number = ?", (decoded,))
-                        acc_data = cursor.fetchone()
-                        conn.close()
-                        if acc_data and acc_data[0] != src_id:
-                            recipient_acc = acc_data[0]
-                            st.success("Recipient account found!")
-                        else:
-                            st.error("Invalid QR code")
+            if recipient_method == "Account Number":
+                manual_acc = st.text_input("Enter Account Number")
+                if manual_acc:
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, user_id FROM accounts WHERE account_number = ?", (manual_acc,))
+                    acc_data = cursor.fetchone()
+                    if acc_data and acc_data[0] != src_id:
+                        recipient_acc = acc_data[0]
+                        cursor.execute("SELECT email FROM users WHERE id = ?", (acc_data[1],))
+                        user_data = cursor.fetchone()
+                        if user_data:
+                            recipient_email = user_data[0]
+                            st.success(f"Recipient: {recipient_email}")
                     else:
-                        st.error("Could not decode QR from camera image.")
+                        st.error("Account not found or same as source")
+                    conn.close()
             
-            manual_acc = st.text_input("Or enter account number manually")
-            if manual_acc:
-                conn = db.get_connection()
-                cursor = conn.cursor()
-                cursor.execute("SELECT id FROM accounts WHERE account_number = ?", (manual_acc,))
-                acc_data = cursor.fetchone()
-                conn.close()
-                if acc_data and acc_data[0] != src_id:
-                    recipient_acc = acc_data[0]
+            elif recipient_method == "Email ID":
+                search_email = st.text_input("Enter Recipient Email")
+                if search_email:
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, full_name FROM users WHERE email = ?", (search_email,))
+                    user_data = cursor.fetchone()
+                    if user_data:
+                        cursor.execute("SELECT id, account_number FROM accounts WHERE user_id = ? AND account_type IN ('Savings','Current') LIMIT 1", (user_data[0],))
+                        acc_data = cursor.fetchone()
+                        if acc_data and acc_data[0] != src_id:
+                            recipient_acc = acc_data[0]
+                            st.success(f"Recipient: {user_data[1]} ({search_email}) - Account: {acc_data[1]}")
+                        else:
+                            st.error("Recipient has no active account or is same as source")
+                    else:
+                        st.error("Email not found")
+                    conn.close()
+            
+            else:  # Scan QR Code
+                st.markdown("### Scan QR Code")
+                scan_method = st.radio("Choose method", ["Upload QR Image", "Use Camera (Live)"])
+                if scan_method == "Upload QR Image":
+                    qr_file = st.file_uploader("Upload QR Code", type=['png','jpg','jpeg'])
+                    if qr_file:
+                        decoded = decode_qr_code(qr_file)
+                        if decoded:
+                            st.success(f"Decoded: {decoded}")
+                            conn = db.get_connection()
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT id, user_id FROM accounts WHERE account_number = ?", (decoded,))
+                            acc_data = cursor.fetchone()
+                            if acc_data and acc_data[0] != src_id:
+                                recipient_acc = acc_data[0]
+                                cursor.execute("SELECT email FROM users WHERE id = ?", (acc_data[1],))
+                                user_data = cursor.fetchone()
+                                if user_data:
+                                    recipient_email = user_data[0]
+                                    st.success(f"Recipient: {recipient_email}")
+                            else:
+                                st.error("Invalid QR code (self or not found)")
+                            conn.close()
+                else:
+                    camera_photo = st.camera_input("Take a photo of the QR code")
+                    if camera_photo:
+                        temp_path = "temp_qr.png"
+                        with open(temp_path, "wb") as f:
+                            f.write(camera_photo.getvalue())
+                        decoded = decode_qr_code(temp_path)
+                        os.remove(temp_path)
+                        if decoded:
+                            st.success(f"Decoded: {decoded}")
+                            conn = db.get_connection()
+                            cursor = conn.cursor()
+                            cursor.execute("SELECT id, user_id FROM accounts WHERE account_number = ?", (decoded,))
+                            acc_data = cursor.fetchone()
+                            if acc_data and acc_data[0] != src_id:
+                                recipient_acc = acc_data[0]
+                                cursor.execute("SELECT email FROM users WHERE id = ?", (acc_data[1],))
+                                user_data = cursor.fetchone()
+                                if user_data:
+                                    recipient_email = user_data[0]
+                                    st.success(f"Recipient: {recipient_email}")
+                            else:
+                                st.error("Invalid QR code")
+                            conn.close()
+                        else:
+                            st.error("Could not decode QR from camera image.")
             
             if st.button("Transfer", type="primary"):
                 if recipient_acc and amount>0:
@@ -611,13 +664,20 @@ if st.session_state.logged_in:
                         st.markdown(f'<div class="alert-danger">⚠️ HIGH FRAUD RISK (Score: {score:.2f})! Transaction blocked.</div>', unsafe_allow_html=True)
                         conn = db.get_connection()
                         cursor = conn.cursor()
-                        cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score) VALUES (?,?,?,?,?,?,?)",
-                                       (src_id, recipient_acc, amount, datetime.now(), 'transfer', 'blocked', score))
-                        tx_id = cursor.lastrowid
-                        cursor.execute("INSERT INTO fraud_alerts (transaction_id, alert_message, timestamp, reviewed) VALUES (?,?,?,?)",
-                                       (tx_id, f"BLOCKED transfer: ₹{amount} from {src_account_number} due to fraud score {score:.2f}", datetime.now(), 0))
-                        conn.commit()
-                        conn.close()
+                        try:
+                            cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score, source) VALUES (?,?,?,?,?,?,?,?)",
+                                           (src_id, recipient_acc, amount, datetime.now(), 'transfer', 'blocked', score, 'online'))
+                            tx_id = cursor.lastrowid
+                            cursor.execute("INSERT INTO fraud_alerts (transaction_id, alert_message, timestamp, reviewed) VALUES (?,?,?,?)",
+                                           (tx_id, f"BLOCKED transfer: ₹{amount} from {src_account_number} to {recipient_email or 'unknown'} due to fraud score {score:.2f}", datetime.now(), 0))
+                            conn.commit()
+                        except sqlite3.OperationalError as e:
+                            if "locked" in str(e):
+                                st.error("Database busy, please try again.")
+                            else:
+                                st.error(f"Error: {e}")
+                        finally:
+                            conn.close()
                     else:
                         conn = db.get_connection()
                         cursor = conn.cursor()
@@ -625,19 +685,22 @@ if st.session_state.logged_in:
                             cursor.execute("BEGIN TRANSACTION")
                             cursor.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, src_id))
                             cursor.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, recipient_acc))
-                            cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score) VALUES (?,?,?,?,?,?,?)",
-                                           (src_id, recipient_acc, amount, datetime.now(), 'transfer', 'completed', score))
+                            cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score, source) VALUES (?,?,?,?,?,?,?,?)",
+                                           (src_id, recipient_acc, amount, datetime.now(), 'transfer', 'completed', score, 'online'))
                             tx_id = cursor.lastrowid
                             if score > 0.7:
                                 cursor.execute("INSERT INTO fraud_alerts (transaction_id, alert_message, timestamp, reviewed) VALUES (?,?,?,?)",
-                                               (tx_id, f"Suspicious transfer ₹{amount} from {src_account_number} (score {score:.2f})", datetime.now(), 0))
+                                               (tx_id, f"Suspicious transfer ₹{amount} from {src_account_number} to {recipient_email or 'unknown'} (score {score:.2f})", datetime.now(), 0))
                                 st.warning(f"⚠️ Fraud score {score:.2f} - transaction flagged.")
                             conn.commit()
-                            st.success(f"✅ Transferred ₹{amount:,.2f} successfully!")
+                            st.success(f"✅ Transferred ₹{amount:,.2f} to {recipient_email or recipient_acc} successfully!")
                             st.balloons()
-                        except Exception as e:
+                        except sqlite3.OperationalError as e:
                             conn.rollback()
-                            st.error(f"Transfer failed: {e}")
+                            if "locked" in str(e):
+                                st.error("Database busy, please try again in a moment.")
+                            else:
+                                st.error(f"Transfer failed: {e}")
                         finally:
                             conn.close()
                             st.rerun()
@@ -653,8 +716,9 @@ if st.session_state.logged_in:
         acc_id = acc_opts[chosen]
         conn = db.get_connection()
         txns = pd.read_sql_query("""
-            SELECT t.id, t.amount, t.timestamp, t.type, t.status, t.fraud_score,
-                   a1.account_number as from_account, a2.account_number as to_account
+            SELECT t.id, t.amount, t.timestamp, t.type, t.status, t.fraud_score, t.source,
+                   COALESCE(a1.account_number, 'SYSTEM') as from_account,
+                   COALESCE(a2.account_number, 'SYSTEM') as to_account
             FROM transactions t
             LEFT JOIN accounts a1 ON t.from_account_id = a1.id
             LEFT JOIN accounts a2 ON t.to_account_id = a2.id
@@ -664,7 +728,7 @@ if st.session_state.logged_in:
         conn.close()
         if len(txns)==0: st.info("No transactions")
         else:
-            st.dataframe(txns[['timestamp','type','amount','from_account','to_account','status','fraud_score']], use_container_width=True,
+            st.dataframe(txns[['timestamp','type','amount','from_account','to_account','status','source','fraud_score']], use_container_width=True,
                          column_config={"amount": st.column_config.NumberColumn("Amount", format="₹%.2f"),
                                         "fraud_score": st.column_config.ProgressColumn("Fraud Score", format="%.2f", min_value=0, max_value=1)})
     
@@ -681,7 +745,10 @@ if st.session_state.logged_in:
         if st.button("Generate Statement"):
             conn = db.get_connection()
             df = pd.read_sql_query("""
-                SELECT t.timestamp, t.type, t.amount, a1.account_number as from_acc, a2.account_number as to_acc, t.status
+                SELECT t.timestamp, t.type, t.amount, t.source,
+                       COALESCE(a1.account_number, 'SYSTEM') as from_acc,
+                       COALESCE(a2.account_number, 'SYSTEM') as to_acc,
+                       t.status
                 FROM transactions t
                 LEFT JOIN accounts a1 ON t.from_account_id = a1.id
                 LEFT JOIN accounts a2 ON t.to_account_id = a2.id
@@ -745,47 +812,62 @@ if st.session_state.logged_in:
             if confirm_text == "DELETE":
                 conn = db.get_connection()
                 cursor = conn.cursor()
-                cursor.execute("DELETE FROM transactions WHERE from_account_id IN (SELECT id FROM accounts WHERE user_id=?) OR to_account_id IN (SELECT id FROM accounts WHERE user_id=?)",
-                               (st.session_state.user_id, st.session_state.user_id))
-                cursor.execute("DELETE FROM accounts WHERE user_id = ?", (st.session_state.user_id,))
-                cursor.execute("DELETE FROM users WHERE id = ?", (st.session_state.user_id,))
-                conn.commit()
-                conn.close()
-                st.success("Account deleted. You will be logged out.")
-                logout()
+                try:
+                    cursor.execute("DELETE FROM transactions WHERE from_account_id IN (SELECT id FROM accounts WHERE user_id=?) OR to_account_id IN (SELECT id FROM accounts WHERE user_id=?)",
+                                   (st.session_state.user_id, st.session_state.user_id))
+                    cursor.execute("DELETE FROM accounts WHERE user_id = ?", (st.session_state.user_id,))
+                    cursor.execute("DELETE FROM users WHERE id = ?", (st.session_state.user_id,))
+                    conn.commit()
+                    st.success("Account deleted. You will be logged out.")
+                    logout()
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e):
+                        st.error("Database busy, please try again.")
+                    else:
+                        st.error(f"Error: {e}")
+                finally:
+                    conn.close()
             else:
                 st.error("Please type DELETE to confirm")
     
     # ==================== ADMIN SECTIONS ====================
     
-    # ---------- ADMIN DASHBOARD (Enhanced with Analytics & User Management) ----------
+    # ---------- ADMIN DASHBOARD ----------
     elif selected == "Admin Dashboard" and st.session_state.is_admin:
         st.title("👑 Admin Dashboard")
-        
-        # Fetch data
         conn = db.get_connection()
         users_df = pd.read_sql_query("SELECT id, full_name, email, pan, created_at FROM users WHERE is_admin = 0", conn)
-        accounts_df = pd.read_sql_query("SELECT a.id, a.user_id, a.account_type, a.account_number, a.balance, u.full_name FROM accounts a JOIN users u ON a.user_id = u.id", conn)
-        transactions_df = pd.read_sql_query("SELECT t.id, t.amount, t.timestamp, t.type, t.status, u.full_name as user_name FROM transactions t LEFT JOIN accounts a ON t.from_account_id = a.id LEFT JOIN users u ON a.user_id = u.id", conn)
-        fraud_df = pd.read_sql_query("SELECT fa.id, fa.alert_message, fa.timestamp, fa.reviewed, u.full_name FROM fraud_alerts fa JOIN transactions t ON fa.transaction_id = t.id LEFT JOIN accounts a ON t.from_account_id = a.id LEFT JOIN users u ON a.user_id = u.id", conn)
+        accounts_df = pd.read_sql_query("SELECT a.id, a.user_id, a.account_type, a.account_number, a.balance, u.full_name, u.email FROM accounts a JOIN users u ON a.user_id = u.id", conn)
+        transactions_df = pd.read_sql_query("""
+            SELECT t.id, t.amount, t.timestamp, t.type, t.status, t.source,
+                   COALESCE(a1.account_number, 'SYSTEM') as from_acc,
+                   COALESCE(a2.account_number, 'SYSTEM') as to_acc,
+                   u.full_name as user_name
+            FROM transactions t
+            LEFT JOIN accounts a1 ON t.from_account_id = a1.id
+            LEFT JOIN accounts a2 ON t.to_account_id = a2.id
+            LEFT JOIN users u ON a1.user_id = u.id
+        """, conn)
+        fraud_df = pd.read_sql_query("""
+            SELECT fa.id, fa.alert_message, fa.timestamp, fa.reviewed, u.full_name
+            FROM fraud_alerts fa
+            JOIN transactions t ON fa.transaction_id = t.id
+            LEFT JOIN accounts a ON t.from_account_id = a.id
+            LEFT JOIN users u ON a.user_id = u.id
+        """, conn)
         conn.close()
         
-        # Tabs
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Overview", "🚨 Fraud Alerts", "📈 Analytics", "👥 User Management"])
+        tab1, tab2, tab3, tab4, tab5 = st.tabs(["📊 Overview", "🚨 Fraud Alerts", "📈 Analytics", "👥 User Management", "💰 Admin Transfer"])
         
-        # ----- Tab 1: Overview -----
         with tab1:
             col1, col2, col3, col4 = st.columns(4)
             with col1: st.metric("Total Users", len(users_df))
             with col2: st.metric("Total Accounts", len(accounts_df))
             with col3: st.metric("Total Transactions", len(transactions_df))
             with col4: st.metric("Pending Fraud Alerts", len(fraud_df[fraud_df['reviewed']==0]))
-            
             st.subheader("Recent Transactions")
-            recent = transactions_df.head(10)
-            st.dataframe(recent[['timestamp', 'user_name', 'amount', 'type', 'status']], use_container_width=True)
+            st.dataframe(transactions_df.head(10)[['timestamp', 'user_name', 'amount', 'type', 'status', 'source', 'from_acc', 'to_acc']], use_container_width=True)
         
-        # ----- Tab 2: Fraud Alerts -----
         with tab2:
             if len(fraud_df)==0:
                 st.info("No fraud alerts")
@@ -802,115 +884,265 @@ if st.session_state.logged_in:
                                 conn.close()
                                 st.rerun()
         
-        # ----- Tab 3: Analytics (Now functional) -----
         with tab3:
             st.subheader("Transaction Trends")
             if len(transactions_df) > 0:
-                # Daily transaction volume
                 txns_daily = transactions_df.copy()
                 txns_daily['date'] = pd.to_datetime(txns_daily['timestamp']).dt.date
                 daily_volume = txns_daily.groupby('date')['amount'].sum().reset_index()
                 fig1 = px.line(daily_volume, x='date', y='amount', title='Daily Transaction Volume (₹)')
                 st.plotly_chart(fig1, use_container_width=True)
-                
-                # Transaction type distribution
                 type_dist = transactions_df['type'].value_counts().reset_index()
                 type_dist.columns = ['Type', 'Count']
                 fig2 = px.pie(type_dist, values='Count', names='Type', title='Transaction Types')
                 st.plotly_chart(fig2, use_container_width=True)
-                
-                # Fraud score distribution (if any)
-                if 'fraud_score' in transactions_df.columns:
-                    fig3 = px.histogram(transactions_df, x='fraud_score', nbins=20, title='Fraud Score Distribution')
-                    st.plotly_chart(fig3, use_container_width=True)
-                
-                # Account balance distribution
-                balance_dist = accounts_df['balance'].value_counts(bins=10).reset_index()
                 fig4 = px.bar(accounts_df, x='account_type', y='balance', title='Balance by Account Type', color='account_type')
                 st.plotly_chart(fig4, use_container_width=True)
             else:
                 st.info("Not enough data for analytics yet.")
         
-        # ----- Tab 4: User Management (All users & accounts + Deposit/Withdraw) -----
         with tab4:
-            st.subheader("All Users and Their Accounts")
-            # Display all users with their accounts
-            all_users_data = []
-            conn = db.get_connection()
-            users_all = pd.read_sql_query("SELECT id, full_name, email, pan FROM users WHERE is_admin = 0", conn)
-            for _, user in users_all.iterrows():
-                user_accounts = pd.read_sql_query("SELECT account_type, account_number, balance FROM accounts WHERE user_id = ?", conn, params=(user['id'],))
-                for _, acc in user_accounts.iterrows():
-                    all_users_data.append({
-                        'User ID': user['id'],
-                        'Name': user['full_name'],
-                        'Email': user['email'],
-                        'PAN': user['pan'],
-                        'Account Type': acc['account_type'],
-                        'Account Number': acc['account_number'],
-                        'Balance (₹)': acc['balance']
-                    })
-            conn.close()
-            
-            if all_users_data:
-                df_users_accounts = pd.DataFrame(all_users_data)
-                st.dataframe(df_users_accounts, use_container_width=True)
+            st.subheader("All Customers")
+            search_email = st.text_input("Search Customer by Email")
+            filtered_users = users_df
+            if search_email:
+                filtered_users = users_df[users_df['email'].str.contains(search_email, case=False)]
+            if len(filtered_users) == 0:
+                st.info("No users found")
             else:
-                st.info("No users found.")
-            
-            st.markdown("---")
-            st.subheader("💰 Admin Deposit / Withdraw")
-            st.write("Perform deposit or withdrawal on any user's account.")
-            
-            # Select user and account
-            conn = db.get_connection()
-            users_list = pd.read_sql_query("SELECT id, full_name, email FROM users WHERE is_admin = 0", conn)
-            user_options = {f"{row['full_name']} ({row['email']})": row['id'] for _, row in users_list.iterrows()}
-            selected_user = st.selectbox("Select User", list(user_options.keys()))
-            user_id = user_options[selected_user]
-            
-            accounts_list = pd.read_sql_query("SELECT id, account_number, account_type, balance FROM accounts WHERE user_id = ?", conn, params=(user_id,))
-            conn.close()
-            if len(accounts_list) == 0:
-                st.warning("This user has no accounts.")
-            else:
-                acc_options = {f"{row['account_type']} - {row['account_number']} (₹{row['balance']:,.2f})": row['id'] for _, row in accounts_list.iterrows()}
-                selected_acc = st.selectbox("Select Account", list(acc_options.keys()))
-                account_id = acc_options[selected_acc]
-                current_balance = accounts_list[accounts_list['id'] == account_id]['balance'].values[0]
-                
-                operation = st.radio("Operation", ["Deposit", "Withdraw"])
-                amount = st.number_input("Amount (₹)", min_value=0.01, step=100.0)
-                
-                if st.button("Execute Transaction"):
-                    if operation == "Deposit":
-                        new_balance = current_balance + amount
-                        # Update account
-                        conn = db.get_connection()
-                        cursor = conn.cursor()
-                        cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, account_id))
-                        # Record transaction (admin deposit from dummy system account)
-                        dummy_account = "ADMIN000"
-                        cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score) VALUES (?,?,?,?,?,?,?)",
-                                       (None, account_id, amount, datetime.now(), 'admin_deposit', 'completed', 0.0))
-                        conn.commit()
-                        conn.close()
-                        st.success(f"✅ Deposited ₹{amount:,.2f} to account. New balance: ₹{new_balance:,.2f}")
-                        st.rerun()
-                    else:  # Withdraw
-                        if amount > current_balance:
-                            st.error("Insufficient balance for withdrawal.")
+                for _, user in filtered_users.iterrows():
+                    with st.expander(f"👤 {user['full_name']} ({user['email']})"):
+                        st.write(f"**PAN:** {user['pan']}")
+                        st.write(f"**Joined:** {user['created_at']}")
+                        user_accounts = accounts_df[accounts_df['user_id'] == user['id']]
+                        if len(user_accounts) > 0:
+                            st.write("**Accounts:**")
+                            for _, acc in user_accounts.iterrows():
+                                col1, col2, col3 = st.columns([2,1,1])
+                                with col1: st.write(f"{acc['account_type']} - {acc['account_number']}")
+                                with col2: st.write(f"₹{acc['balance']:,.2f}")
+                                with col3:
+                                    if st.button("Select", key=f"select_acc_{acc['id']}"):
+                                        st.session_state.admin_selected_account = acc['id']
+                                        st.success(f"Selected account {acc['account_number']}")
+                            if 'admin_selected_account' in st.session_state and st.session_state.admin_selected_account in user_accounts['id'].values:
+                                acc_id = st.session_state.admin_selected_account
+                                acc_balance = user_accounts[user_accounts['id']==acc_id]['balance'].values[0]
+                                st.write(f"**Selected Account Balance:** ₹{acc_balance:,.2f}")
+                                action = st.radio(f"Action for {user['full_name']}", ["Deposit", "Withdraw", "Transfer to Another Customer"], key=f"action_{user['id']}")
+                                if action in ["Deposit", "Withdraw"]:
+                                    amount = st.number_input("Amount (₹)", min_value=0.01, step=100.0, key=f"amount_{user['id']}")
+                                    if st.button("Execute", key=f"exec_{user['id']}"):
+                                        conn = db.get_connection()
+                                        cursor = conn.cursor()
+                                        try:
+                                            if action == "Deposit":
+                                                new_balance = acc_balance + amount
+                                                cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, acc_id))
+                                                cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score, source) VALUES (?,?,?,?,?,?,?,?)",
+                                                               (None, acc_id, amount, datetime.now(), 'admin_deposit', 'completed', 0.0, 'admin'))
+                                                conn.commit()
+                                                st.success(f"Deposited ₹{amount:,.2f}. New balance: ₹{new_balance:,.2f}")
+                                                st.rerun()
+                                            else:
+                                                if amount > acc_balance:
+                                                    st.error("Insufficient balance")
+                                                else:
+                                                    new_balance = acc_balance - amount
+                                                    cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, acc_id))
+                                                    cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score, source) VALUES (?,?,?,?,?,?,?,?)",
+                                                                   (acc_id, None, amount, datetime.now(), 'admin_withdraw', 'completed', 0.0, 'admin'))
+                                                    conn.commit()
+                                                    st.success(f"Withdrew ₹{amount:,.2f}. New balance: ₹{new_balance:,.2f}")
+                                                    st.rerun()
+                                        except sqlite3.OperationalError as e:
+                                            if "locked" in str(e):
+                                                st.error("Database busy, please try again.")
+                                            else:
+                                                st.error(f"Error: {e}")
+                                        finally:
+                                            conn.close()
+                                elif action == "Transfer to Another Customer":
+                                    other_users = users_df[users_df['id'] != user['id']]
+                                    if len(other_users) == 0:
+                                        st.warning("No other customers to transfer to")
+                                    else:
+                                        target_user = st.selectbox("Select Target Customer", other_users['email'].tolist(), key=f"target_{user['id']}")
+                                        target_user_id = other_users[other_users['email'] == target_user]['id'].values[0]
+                                        conn = db.get_connection()
+                                        target_accounts = pd.read_sql_query(
+                                            "SELECT id, account_number, account_type, balance FROM accounts WHERE user_id = ? AND account_type IN ('Savings','Current')",
+                                            conn, params=(target_user_id,))
+                                        conn.close()
+                                        if len(target_accounts) == 0:
+                                            st.warning(f"{target_user} has no active account.")
+                                            if st.button(f"Create Savings Account for {target_user}", key=f"create_for_target_{user['id']}"):
+                                                conn = db.get_connection()
+                                                cursor = conn.cursor()
+                                                try:
+                                                    acc_num = generate_account_number()
+                                                    cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance) VALUES (?,?,?,?)",
+                                                                   (target_user_id, 'Savings', acc_num, 5000.00))
+                                                    conn.commit()
+                                                    st.success(f"Created account {acc_num} with ₹5000")
+                                                    st.rerun()
+                                                except sqlite3.OperationalError as e:
+                                                    if "locked" in str(e):
+                                                        st.error("Database busy, please try again.")
+                                                    else:
+                                                        st.error(f"Error: {e}")
+                                                finally:
+                                                    conn.close()
+                                        else:
+                                            target_acc = st.selectbox("Select Target Account", target_accounts['account_number'].tolist(), key=f"target_acc_{user['id']}")
+                                            target_acc_id = target_accounts[target_accounts['account_number'] == target_acc]['id'].values[0]
+                                            transfer_amount = st.number_input("Transfer Amount (₹)", min_value=0.01, step=100.0, key=f"transfer_amt_{user['id']}")
+                                            if st.button("Execute Transfer", key=f"transfer_exec_{user['id']}"):
+                                                if transfer_amount > acc_balance:
+                                                    st.error("Insufficient balance in source account")
+                                                else:
+                                                    conn = db.get_connection()
+                                                    cursor = conn.cursor()
+                                                    try:
+                                                        cursor.execute("BEGIN TRANSACTION")
+                                                        cursor.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (transfer_amount, acc_id))
+                                                        cursor.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (transfer_amount, target_acc_id))
+                                                        cursor.execute("""
+                                                            INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score, source)
+                                                            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                                                        """, (acc_id, target_acc_id, transfer_amount, datetime.now(), 'admin_transfer', 'completed', 0.0, 'admin'))
+                                                        conn.commit()
+                                                        st.success(f"Transferred ₹{transfer_amount:,.2f} from {user['full_name']} to {target_user}")
+                                                        st.rerun()
+                                                    except sqlite3.OperationalError as e:
+                                                        conn.rollback()
+                                                        if "locked" in str(e):
+                                                            st.error("Database busy, please try again.")
+                                                        else:
+                                                            st.error(f"Transfer failed: {e}")
+                                                    finally:
+                                                        conn.close()
                         else:
-                            new_balance = current_balance - amount
+                            st.write("No accounts found for this user")
+        
+        with tab5:
+            st.subheader("💰 Transfer Money Between Customers")
+            conn = db.get_connection()
+            customers = pd.read_sql_query("SELECT id, full_name, email FROM users WHERE is_admin = 0", conn)
+            conn.close()
+            
+            if len(customers) < 2:
+                st.warning("Need at least two customers to perform a transfer")
+            else:
+                col1, col2 = st.columns(2)
+                with col1:
+                    from_customer_email = st.selectbox("From Customer", customers['email'].tolist(), key="from_cust_tab5")
+                    from_customer = customers[customers['email'] == from_customer_email].iloc[0]
+                    from_user_id = from_customer['id']
+                    conn = db.get_connection()
+                    from_accounts = pd.read_sql_query(
+                        "SELECT id, account_number, account_type, balance FROM accounts WHERE user_id = ? AND account_type IN ('Savings','Current')",
+                        conn, params=(from_user_id,))
+                    conn.close()
+                    if len(from_accounts) == 0:
+                        st.error(f"No active account for {from_customer_email}. Create one first.")
+                        if st.button(f"Create Savings Account for {from_customer_email}", key="create_from_tab5"):
                             conn = db.get_connection()
                             cursor = conn.cursor()
-                            cursor.execute("UPDATE accounts SET balance = ? WHERE id = ?", (new_balance, account_id))
-                            cursor.execute("INSERT INTO transactions (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score) VALUES (?,?,?,?,?,?,?)",
-                                           (account_id, None, amount, datetime.now(), 'admin_withdraw', 'completed', 0.0))
+                            try:
+                                acc_num = generate_account_number()
+                                cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance) VALUES (?,?,?,?)",
+                                               (from_user_id, 'Savings', acc_num, 5000.00))
+                                conn.commit()
+                                st.rerun()
+                            except sqlite3.OperationalError as e:
+                                if "locked" in str(e):
+                                    st.error("Database busy, please try again.")
+                                else:
+                                    st.error(f"Error: {e}")
+                            finally:
+                                conn.close()
+                        from_acc_id = None
+                        from_balance = 0
+                    else:
+                        from_acc_display = {f"{row['account_type']} - {row['account_number']} (₹{row['balance']:,.2f})": row['id'] 
+                                            for _, row in from_accounts.iterrows()}
+                        from_acc_label = st.selectbox("From Account", list(from_acc_display.keys()), key="from_acc_tab5")
+                        from_acc_id = from_acc_display[from_acc_label]
+                        from_balance = from_accounts[from_accounts['id'] == from_acc_id]['balance'].values[0]
+                        st.info(f"Balance: ₹{from_balance:,.2f}")
+                
+                with col2:
+                    other_customers = customers[customers['email'] != from_customer_email]
+                    if len(other_customers) == 0:
+                        st.warning("No other customers")
+                        to_acc_id = None
+                    else:
+                        to_customer_email = st.selectbox("To Customer", other_customers['email'].tolist(), key="to_cust_tab5")
+                        to_customer = other_customers[other_customers['email'] == to_customer_email].iloc[0]
+                        to_user_id = to_customer['id']
+                        conn = db.get_connection()
+                        to_accounts = pd.read_sql_query(
+                            "SELECT id, account_number, account_type, balance FROM accounts WHERE user_id = ? AND account_type IN ('Savings','Current')",
+                            conn, params=(to_user_id,))
+                        conn.close()
+                        if len(to_accounts) == 0:
+                            st.error(f"No active account for {to_customer_email}. Create one first.")
+                            if st.button(f"Create Savings Account for {to_customer_email}", key="create_to_tab5"):
+                                conn = db.get_connection()
+                                cursor = conn.cursor()
+                                try:
+                                    acc_num = generate_account_number()
+                                    cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance) VALUES (?,?,?,?)",
+                                                   (to_user_id, 'Savings', acc_num, 5000.00))
+                                    conn.commit()
+                                    st.rerun()
+                                except sqlite3.OperationalError as e:
+                                    if "locked" in str(e):
+                                        st.error("Database busy, please try again.")
+                                    else:
+                                        st.error(f"Error: {e}")
+                                finally:
+                                    conn.close()
+                            to_acc_id = None
+                        else:
+                            to_acc_display = {f"{row['account_type']} - {row['account_number']} (₹{row['balance']:,.2f})": row['id'] 
+                                              for _, row in to_accounts.iterrows()}
+                            to_acc_label = st.selectbox("To Account", list(to_acc_display.keys()), key="to_acc_tab5")
+                            to_acc_id = to_acc_display[to_acc_label]
+                
+                amount = st.number_input("Transfer Amount (₹)", min_value=0.01, step=100.0, key="amount_tab5")
+                if st.button("Execute Transfer", key="transfer_btn_tab5"):
+                    if from_acc_id is None or to_acc_id is None:
+                        st.error("Please ensure both customers have an active account.")
+                    elif amount <= 0:
+                        st.error("Amount must be positive.")
+                    elif amount > from_balance:
+                        st.error("Insufficient balance.")
+                    else:
+                        conn = db.get_connection()
+                        cursor = conn.cursor()
+                        try:
+                            cursor.execute("BEGIN TRANSACTION")
+                            cursor.execute("UPDATE accounts SET balance = balance - ? WHERE id = ?", (amount, from_acc_id))
+                            cursor.execute("UPDATE accounts SET balance = balance + ? WHERE id = ?", (amount, to_acc_id))
+                            cursor.execute("""
+                                INSERT INTO transactions 
+                                (from_account_id, to_account_id, amount, timestamp, type, status, fraud_score, source)
+                                VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                            """, (from_acc_id, to_acc_id, amount, datetime.now(), 'admin_transfer', 'completed', 0.0, 'admin'))
                             conn.commit()
-                            conn.close()
-                            st.success(f"✅ Withdrew ₹{amount:,.2f} from account. New balance: ₹{new_balance:,.2f}")
+                            st.success(f"✅ Transferred ₹{amount:,.2f} from {from_customer_email} to {to_customer_email}")
+                            st.balloons()
                             st.rerun()
+                        except sqlite3.OperationalError as e:
+                            conn.rollback()
+                            if "locked" in str(e):
+                                st.error("Database busy, please try again in a moment.")
+                            else:
+                                st.error(f"Transfer failed: {e}")
+                        finally:
+                            conn.close()
     
     # ---------- EMPLOYEE MANAGEMENT ----------
     elif selected == "Employee Management" and st.session_state.is_admin:
@@ -923,8 +1155,7 @@ if st.session_state.logged_in:
                 emp_phone = st.text_input("Phone")
                 emp_join = st.date_input("Join Date", datetime.now().date())
                 emp_salary = st.number_input("Monthly Salary (₹)", min_value=0.0, step=1000.0)
-                submitted = st.form_submit_button("Add Employee")
-                if submitted:
+                if st.form_submit_button("Add Employee"):
                     if emp_name and emp_email:
                         conn = db.get_connection()
                         cursor = conn.cursor()
@@ -935,6 +1166,11 @@ if st.session_state.logged_in:
                             st.success(f"Employee {emp_name} added!")
                         except sqlite3.IntegrityError:
                             st.error("Email already exists")
+                        except sqlite3.OperationalError as e:
+                            if "locked" in str(e):
+                                st.error("Database busy, please try again.")
+                            else:
+                                st.error(f"Error: {e}")
                         finally:
                             conn.close()
                     else:
@@ -951,103 +1187,193 @@ if st.session_state.logged_in:
             if st.button("Save Changes"):
                 conn = db.get_connection()
                 cursor = conn.cursor()
-                for _, row in edited.iterrows():
-                    cursor.execute("UPDATE employees SET name=?, role=?, email=?, phone=?, join_date=?, salary=? WHERE id=?",
-                                   (row['name'], row['role'], row['email'], row['phone'], row['join_date'], row['salary'], row['id']))
-                conn.commit()
-                conn.close()
-                st.success("Employee data updated!")
-                st.rerun()
+                try:
+                    for _, row in edited.iterrows():
+                        cursor.execute("UPDATE employees SET name=?, role=?, email=?, phone=?, join_date=?, salary=? WHERE id=?",
+                                       (row['name'], row['role'], row['email'], row['phone'], row['join_date'], row['salary'], row['id']))
+                    conn.commit()
+                    st.success("Employee data updated!")
+                    st.rerun()
+                except sqlite3.OperationalError as e:
+                    if "locked" in str(e):
+                        st.error("Database busy, please try again.")
+                    else:
+                        st.error(f"Error: {e}")
+                finally:
+                    conn.close()
             del_id = st.number_input("Employee ID to delete", min_value=0, step=1)
             if st.button("Delete Employee"):
                 if del_id:
                     conn = db.get_connection()
-                    conn.execute("DELETE FROM employees WHERE id = ?", (del_id,))
-                    conn.commit()
-                    conn.close()
-                    st.success(f"Employee {del_id} deleted")
-                    st.rerun()
+                    cursor = conn.cursor()
+                    try:
+                        cursor.execute("DELETE FROM employees WHERE id = ?", (del_id,))
+                        conn.commit()
+                        st.success(f"Employee {del_id} deleted")
+                        st.rerun()
+                    except sqlite3.OperationalError as e:
+                        if "locked" in str(e):
+                            st.error("Database busy, please try again.")
+                        else:
+                            st.error(f"Error: {e}")
+                    finally:
+                        conn.close()
     
     # ---------- BANK STATEMENTS (Admin) ----------
     elif selected == "Bank Statements" and st.session_state.is_admin:
         st.title("🏦 Bank Statements (Admin)")
-        conn = db.get_connection()
-        users_df = pd.read_sql_query("SELECT id, email, full_name FROM users", conn)
-        user_options = {f"{row['full_name']} ({row['email']})": row['id'] for _, row in users_df.iterrows()}
-        selected_user = st.selectbox("Select User", list(user_options.keys()))
-        user_id = user_options[selected_user]
-        accounts_df = pd.read_sql_query("SELECT id, account_type, account_number FROM accounts WHERE user_id = ?", conn, params=(user_id,))
-        conn.close()
-        if len(accounts_df)==0:
-            st.warning("This user has no accounts.")
-        else:
-            acc_options = {f"{row['account_type']} - {row['account_number']}": row['id'] for _, row in accounts_df.iterrows()}
-            selected_acc = st.selectbox("Select Account", list(acc_options.keys()))
-            account_id = acc_options[selected_acc]
+        report_type = st.radio("Select Statement Type", ["All Transactions (Date Range)", "By Customer Account"])
+        
+        if report_type == "All Transactions (Date Range)":
             col1, col2 = st.columns(2)
             with col1: start_date = st.date_input("From Date", datetime.now().date() - timedelta(days=30))
             with col2: end_date = st.date_input("To Date", datetime.now().date())
-            if st.button("Generate Statement"):
+            if st.button("Generate All Transactions Statement"):
                 conn = db.get_connection()
                 stmt = pd.read_sql_query("""
-                    SELECT t.timestamp, t.type, t.amount, 
-                           a1.account_number as from_account, a2.account_number as to_account,
-                           t.status, t.fraud_score
+                    SELECT 
+                        t.timestamp, 
+                        t.type, 
+                        t.amount, 
+                        t.source, 
+                        t.status,
+                        COALESCE(a1.account_number, 'SYSTEM') AS from_account,
+                        COALESCE(a2.account_number, 'SYSTEM') AS to_account,
+                        COALESCE(u1.full_name, 'SYSTEM') AS from_user,
+                        COALESCE(u2.full_name, 'SYSTEM') AS to_user
                     FROM transactions t
                     LEFT JOIN accounts a1 ON t.from_account_id = a1.id
+                    LEFT JOIN users u1 ON a1.user_id = u1.id
                     LEFT JOIN accounts a2 ON t.to_account_id = a2.id
-                    WHERE (t.from_account_id = ? OR t.to_account_id = ?)
-                    AND DATE(t.timestamp) BETWEEN ? AND ?
+                    LEFT JOIN users u2 ON a2.user_id = u2.id
+                    WHERE DATE(t.timestamp) BETWEEN ? AND ?
                     ORDER BY t.timestamp
-                """, conn, params=(account_id, account_id, start_date, end_date))
+                """, conn, params=(start_date, end_date))
                 conn.close()
                 if len(stmt)==0:
                     st.info("No transactions in this period.")
                 else:
-                    st.subheader(f"Statement for {selected_acc} ({start_date} to {end_date})")
+                    st.subheader(f"All Transactions from {start_date} to {end_date}")
                     st.dataframe(stmt, use_container_width=True)
                     csv = stmt.to_csv(index=False)
-                    st.download_button("Download CSV", csv, file_name=f"admin_statement_{selected_acc}_{start_date}_{end_date}.csv")
+                    st.download_button("Download CSV", csv, file_name=f"all_transactions_{start_date}_{end_date}.csv")
+        
+        else:  # By Customer Account
+            conn = db.get_connection()
+            users_df = pd.read_sql_query("SELECT id, email, full_name FROM users WHERE is_admin = 0", conn)
+            user_options = {f"{row['full_name']} ({row['email']})": row['id'] for _, row in users_df.iterrows()}
+            selected_user = st.selectbox("Select User", list(user_options.keys()))
+            user_id = user_options[selected_user]
+            accounts_df = pd.read_sql_query("SELECT id, account_type, account_number FROM accounts WHERE user_id = ?", conn, params=(user_id,))
+            conn.close()
+            if len(accounts_df)==0:
+                st.warning("This user has no accounts.")
+            else:
+                acc_options = {f"{row['account_type']} - {row['account_number']}": row['id'] for _, row in accounts_df.iterrows()}
+                selected_acc = st.selectbox("Select Account", list(acc_options.keys()))
+                account_id = acc_options[selected_acc]
+                col1, col2 = st.columns(2)
+                with col1: start_date = st.date_input("From Date", datetime.now().date() - timedelta(days=30))
+                with col2: end_date = st.date_input("To Date", datetime.now().date())
+                if st.button("Generate Customer Statement"):
+                    conn = db.get_connection()
+                    stmt = pd.read_sql_query("""
+                        SELECT 
+                            t.timestamp, 
+                            t.type, 
+                            t.amount, 
+                            t.source,
+                            COALESCE(a1.account_number, 'SYSTEM') AS from_account,
+                            COALESCE(a2.account_number, 'SYSTEM') AS to_account,
+                            COALESCE(u1.full_name, 'SYSTEM') AS from_user,
+                            COALESCE(u2.full_name, 'SYSTEM') AS to_user,
+                            t.status, 
+                            t.fraud_score
+                        FROM transactions t
+                        LEFT JOIN accounts a1 ON t.from_account_id = a1.id
+                        LEFT JOIN users u1 ON a1.user_id = u1.id
+                        LEFT JOIN accounts a2 ON t.to_account_id = a2.id
+                        LEFT JOIN users u2 ON a2.user_id = u2.id
+                        WHERE (t.from_account_id = ? OR t.to_account_id = ?)
+                        AND DATE(t.timestamp) BETWEEN ? AND ?
+                        ORDER BY t.timestamp
+                    """, conn, params=(account_id, account_id, start_date, end_date))
+                    conn.close()
+                    if len(stmt)==0:
+                        st.info("No transactions in this period.")
+                    else:
+                        st.subheader(f"Statement for {selected_acc} ({start_date} to {end_date})")
+                        st.dataframe(stmt, use_container_width=True)
+                        csv = stmt.to_csv(index=False)
+                        st.download_button("Download CSV", csv, file_name=f"customer_statement_{selected_acc}_{start_date}_{end_date}.csv")
     
     # ---------- USER ACCOUNT LOOKUP ----------
     elif selected == "User Account Lookup" and st.session_state.is_admin:
         st.title("🔍 User Account Lookup")
-        acc_num = st.text_input("Enter Account Number")
-        if st.button("Search"):
-            if acc_num:
-                conn = db.get_connection()
-                cursor = conn.cursor()
-                cursor.execute("""
-                    SELECT a.id, a.account_type, a.account_number, a.balance, a.created_at,
-                           u.id, u.full_name, u.email, u.pan
-                    FROM accounts a
-                    JOIN users u ON a.user_id = u.id
-                    WHERE a.account_number = ?
-                """, (acc_num,))
-                result = cursor.fetchone()
-                conn.close()
-                if result:
-                    st.success(f"Account found for user: {result[6]}")
-                    st.json({
-                        "Account Number": result[2],
-                        "Type": result[1],
-                        "Balance": f"₹{result[3]:,.2f}",
-                        "Opened On": result[4],
-                        "User Name": result[6],
-                        "User Email": result[7],
-                        "User PAN": result[8]
-                    })
+        search_by = st.radio("Search by:", ["Account Number", "Email"])
+        if search_by == "Account Number":
+            acc_num = st.text_input("Enter Account Number")
+            if st.button("Search"):
+                if acc_num:
                     conn = db.get_connection()
-                    txns = pd.read_sql_query("""
-                        SELECT t.timestamp, t.amount, a1.account_number as from_acc, a2.account_number as to_acc, t.status
-                        FROM transactions t
-                        LEFT JOIN accounts a1 ON t.from_account_id = a1.id
-                        LEFT JOIN accounts a2 ON t.to_account_id = a2.id
-                        WHERE t.from_account_id = ? OR t.to_account_id = ?
-                        ORDER BY t.timestamp DESC LIMIT 10
-                    """, conn, params=(result[0], result[0]))
+                    cursor = conn.cursor()
+                    cursor.execute("""
+                        SELECT a.id, a.account_type, a.account_number, a.balance, a.created_at,
+                               u.id, u.full_name, u.email, u.pan
+                        FROM accounts a
+                        JOIN users u ON a.user_id = u.id
+                        WHERE a.account_number = ?
+                    """, (acc_num,))
+                    result = cursor.fetchone()
                     conn.close()
-                    st.subheader("Recent Transactions")
-                    st.dataframe(txns)
-                else:
-                    st.error("Account number not found")
+                    if result:
+                        st.success(f"Account found for user: {result[6]}")
+                        st.json({
+                            "Account Number": result[2],
+                            "Type": result[1],
+                            "Balance": f"₹{result[3]:,.2f}",
+                            "Opened On": result[4],
+                            "User Name": result[6],
+                            "User Email": result[7],
+                            "User PAN": result[8]
+                        })
+                        conn = db.get_connection()
+                        txns = pd.read_sql_query("""
+                            SELECT t.timestamp, t.amount, t.source,
+                                   COALESCE(a1.account_number, 'SYSTEM') as from_acc,
+                                   COALESCE(a2.account_number, 'SYSTEM') as to_acc,
+                                   t.status
+                            FROM transactions t
+                            LEFT JOIN accounts a1 ON t.from_account_id = a1.id
+                            LEFT JOIN accounts a2 ON t.to_account_id = a2.id
+                            WHERE t.from_account_id = ? OR t.to_account_id = ?
+                            ORDER BY t.timestamp DESC LIMIT 10
+                        """, conn, params=(result[0], result[0]))
+                        conn.close()
+                        st.subheader("Recent Transactions")
+                        st.dataframe(txns)
+                    else:
+                        st.error("Account number not found")
+        else:
+            email = st.text_input("Enter Email")
+            if st.button("Search"):
+                if email:
+                    conn = db.get_connection()
+                    cursor = conn.cursor()
+                    cursor.execute("SELECT id, full_name, email, pan FROM users WHERE email = ?", (email,))
+                    user = cursor.fetchone()
+                    if user:
+                        st.success(f"User found: {user[1]}")
+                        st.json({
+                            "User ID": user[0],
+                            "Name": user[1],
+                            "Email": user[2],
+                            "PAN": user[3]
+                        })
+                        accounts = pd.read_sql_query("SELECT account_number, account_type, balance FROM accounts WHERE user_id = ?", conn, params=(user[0],))
+                        conn.close()
+                        if len(accounts) > 0:
+                            st.subheader("User Accounts")
+                            st.dataframe(accounts)
+                    else:
+                        st.error("Email not found")
