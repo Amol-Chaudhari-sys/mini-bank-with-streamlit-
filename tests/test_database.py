@@ -1,25 +1,38 @@
-import sys
-import os
-sys.path.append(os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
-
 import sqlite3
-from app import DatabaseManager
+import tempfile
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
-def test_user_creation():
-    db = DatabaseManager("test.db")
+from app import DatabaseManager, generate_account_number
+
+def test_create_user_and_account():
+    # Use a temporary file database (not :memory:)
+    with tempfile.NamedTemporaryFile(suffix='.db', delete=False) as tmp:
+        tmp_path = tmp.name
+    
+    db = DatabaseManager(tmp_path)
     db.initialize_database()
-
     conn = db.get_connection()
     cursor = conn.cursor()
-
-    cursor.execute("INSERT INTO users (email, password_hash, full_name, pan) VALUES (?, ?, ?, ?)",
-                   ("test@test.com", "hash", "Test User", "ABCDE1234Z"))
     
+    # Insert a test user
+    cursor.execute("INSERT INTO users (email, password_hash, full_name, pan, photo_path) VALUES (?,?,?,?,?)",
+                   ("test@example.com", "hash", "Test User", "ABCDE1234F", ""))
+    user_id = cursor.lastrowid
+    
+    # Create account
+    acc_num = generate_account_number()
+    cursor.execute("INSERT INTO accounts (user_id, account_type, account_number, balance) VALUES (?,?,?,?)",
+                   (user_id, "Savings", acc_num, 1000))
     conn.commit()
-
-    cursor.execute("SELECT * FROM users WHERE email=?", ("test@test.com",))
-    user = cursor.fetchone()
-
+    
+    # Verify
+    cursor.execute("SELECT balance FROM accounts WHERE account_number = ?", (acc_num,))
+    balance = cursor.fetchone()[0]
+    assert balance == 1000
+    
     conn.close()
-
-    assert user is not None
+    # Clean up
+    import os
+    os.unlink(tmp_path)

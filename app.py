@@ -320,7 +320,7 @@ if st.session_state.logged_in:
                 selected = admin_main
         
         st.markdown("---")
-        if st.button("🚪 Logout", use_container_width=True):
+        if st.button("🚪 Logout", use_container_width=True, key="logout_btn"):
             logout()
         st.markdown("---")
         st.caption("AI Banking Suite v1.0")
@@ -353,6 +353,8 @@ if not st.session_state.logged_in:
         with tab2:
             with st.form("register_form"):
                 full_name = st.text_input("Full Name", help="Only alphabets and spaces allowed")
+                if full_name and not validate_name(full_name):
+                    st.error("Full name can only contain letters and spaces")
                 email = st.text_input("Email")
                 pan = st.text_input("PAN Number")
                 password = st.text_input("Password", type="password")
